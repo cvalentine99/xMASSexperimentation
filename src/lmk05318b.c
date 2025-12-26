@@ -745,34 +745,104 @@ lmk05318b_error_t lmk05318b_load_config_file(lmk05318b_state_t *state,
     if (!is_initialized(state) || !filename) {
         return LMK05318B_ERR_INVALID_PARAM;
     }
-    
+
+    /* Validate filename is not empty */
+    if (filename[0] == '\0') {
+        return LMK05318B_ERR_INVALID_PARAM;
+    }
+
     FILE *fp = fopen(filename, "r");
     if (!fp) {
         return LMK05318B_ERR_INVALID_PARAM;
     }
-    
+
     char line[256];
     lmk05318b_error_t err = LMK05318B_OK;
-    
+    int line_num = 0;
+    int valid_entries = 0;
+
     while (fgets(line, sizeof(line), fp)) {
-        /* Skip comments and empty lines */
-        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
+        line_num++;
+
+        /* Check for line truncation (line too long) */
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n' && !feof(fp)) {
+            /* Line was truncated - skip to end of this line */
+            int c;
+            while ((c = fgetc(fp)) != '\n' && c != EOF);
+            continue;  /* Skip this malformed line */
+        }
+
+        /* Remove trailing newline/carriage return */
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+
+        /* Skip empty lines and comments */
+        if (len == 0 || line[0] == '#') {
             continue;
         }
-        
-        /* Parse hex value (format: 0xADDRVV or ADDRVAL) */
-        uint32_t value;
-        if (sscanf(line, "0x%x", &value) == 1 || sscanf(line, "%x", &value) == 1) {
-            uint16_t addr = (value >> 8) & 0xFFFF;
-            uint8_t data = value & 0xFF;
-            
-            err = lmk05318b_reg_write(state, addr, data);
-            if (err != LMK05318B_OK) {
-                break;
-            }
+
+        /* Skip lines that are only whitespace */
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0' || *p == '#') {
+            continue;
         }
+
+        /* Parse hex value (format: 0xADDRVV or ADDRVAL)
+         * Expected: 3-6 hex digits representing addr (2 bytes) + data (1 byte)
+         */
+        uint32_t value = 0;
+        int parsed = 0;
+        char extra;
+
+        /* Try 0x prefix first, then bare hex */
+        if (sscanf(line, " 0x%x%c", &value, &extra) == 1 ||
+            sscanf(line, " 0x%x", &value) == 1 ||
+            sscanf(line, " %x%c", &value, &extra) == 1 ||
+            sscanf(line, " %x", &value) == 1) {
+            parsed = 1;
+        }
+
+        if (!parsed) {
+            /* Not a valid hex line - skip silently */
+            continue;
+        }
+
+        /* Validate the parsed value
+         * Format: ADDRVAL where ADDR is register address, VAL is 8-bit value
+         * Minimum valid: 0x000 (addr=0, val=0)
+         * Maximum reasonable: 0xFFFFFF (addr=0xFFFF, val=0xFF)
+         */
+        if (value > 0xFFFFFF) {
+            /* Value too large - skip this line */
+            continue;
+        }
+
+        uint16_t addr = (value >> 8) & 0xFFFF;
+        uint8_t data = value & 0xFF;
+
+        /* Validate register address is within reasonable bounds */
+        if (addr > 0x0200) {
+            /* Address beyond known register space - skip */
+            continue;
+        }
+
+        err = lmk05318b_reg_write(state, addr, data);
+        if (err != LMK05318B_OK) {
+            fclose(fp);
+            return err;
+        }
+        valid_entries++;
     }
-    
+
     fclose(fp);
-    return err;
+
+    /* Return error if no valid entries were found */
+    if (valid_entries == 0 && line_num > 0) {
+        return LMK05318B_ERR_INVALID_PARAM;
+    }
+
+    return LMK05318B_OK;
 }

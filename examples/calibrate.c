@@ -6,6 +6,7 @@
  * a known reference signal.
  */
 
+#define _USE_MATH_DEFINES
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +15,9 @@
 #include <getopt.h>
 #include "xmass_sync.h"
 
-#define PI 3.14159265358979323846
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 static void print_usage(const char *prog)
 {
@@ -178,7 +181,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < sync.num_channels; i++) {
         printf("  Channel %d: %+8.3f° (%+.6f rad)\n",
                i,
-               sync.calibration.phase_offset[i] * 180.0 / PI,
+               sync.calibration.phase_offset[i] * 180.0 / M_PI,
                sync.calibration.phase_offset[i]);
     }
     
@@ -194,7 +197,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < sync.num_channels; i++) {
         printf("  Channel %d: ±%.3f° (±%.6f rad)\n",
                i,
-               sync.calibration.phase_stability[i] * 180.0 / PI,
+               sync.calibration.phase_stability[i] * 180.0 / M_PI,
                sync.calibration.phase_stability[i]);
     }
     
@@ -212,7 +215,7 @@ int main(int argc, char *argv[])
         }
     }
     
-    double stability_deg = max_stability * 180.0 / PI;
+    double stability_deg = max_stability * 180.0 / M_PI;
     
     if (stability_deg < 1.0) {
         printf("  [EXCELLENT] Phase stability < 1°\n");

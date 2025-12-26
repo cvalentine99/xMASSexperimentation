@@ -30,6 +30,22 @@ extern "C" {
 #define XMASS_SYNC_DEFAULT_CAL_SAMPLES 8192 /* Default calibration samples */
 #define XMASS_SYNC_CAL_SNAPSHOTS    10      /* Number of snapshots for averaging */
 
+/* Timing constants (milliseconds) */
+#define XMASS_SYNC_STREAM_SETTLE_MS     100     /* Time to wait after starting streams */
+#define XMASS_SYNC_SNAPSHOT_DELAY_MS    10      /* Delay between calibration snapshots */
+
+/* Buffer sizes */
+#define XMASS_SYNC_COHERENCE_SAMPLES    4096    /* Samples for coherence measurement */
+
+/* Calibration quality thresholds */
+#define XMASS_SYNC_MIN_AMPLITUDE        1e-10   /* Minimum amplitude for valid signal */
+
+/* Default configuration values */
+#define XMASS_SYNC_DEFAULT_SAMPLE_RATE  1e6     /* 1 MSPS */
+#define XMASS_SYNC_DEFAULT_BANDWIDTH    1e6     /* 1 MHz */
+#define XMASS_SYNC_DEFAULT_GAIN         40.0    /* 40 dB */
+#define XMASS_SYNC_DEFAULT_CAL_INTERVAL 1800    /* 30 minutes */
+
 /*============================================================================
  * Error Codes
  *===========================================================================*/
