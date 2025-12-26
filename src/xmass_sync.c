@@ -6,6 +6,7 @@
  * @license MIT
  */
 
+#define _USE_MATH_DEFINES  /* For M_PI on some systems */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,11 +15,10 @@
 #include <unistd.h>
 #include "xmass_sync.h"
 
-/*============================================================================
- * Internal Constants
- *===========================================================================*/
-
-#define PI 3.14159265358979323846
+/* Ensure M_PI is defined */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /*============================================================================
  * Error Strings
@@ -93,13 +93,13 @@ void xmass_sync_buffer_clear(xmass_sync_buffer_t *buffer)
 void xmass_sync_get_default_config(xmass_sync_config_t *config)
 {
     if (!config) return;
-    
-    config->sample_rate = 1e6;              /* 1 MSPS */
-    config->bandwidth = 1e6;                /* 1 MHz */
-    config->gain = 40.0;                    /* 40 dB */
-    config->num_samples = 8192;             /* 8K samples */
-    config->calibration_freq = 100e6;       /* 100 MHz */
-    config->calibration_interval = 1800;    /* 30 minutes */
+
+    config->sample_rate = XMASS_SYNC_DEFAULT_SAMPLE_RATE;
+    config->bandwidth = XMASS_SYNC_DEFAULT_BANDWIDTH;
+    config->gain = XMASS_SYNC_DEFAULT_GAIN;
+    config->num_samples = XMASS_SYNC_DEFAULT_CAL_SAMPLES;
+    config->calibration_freq = XMASS_SYNC_DEFAULT_CAL_FREQ;
+    config->calibration_interval = XMASS_SYNC_DEFAULT_CAL_INTERVAL;
     config->auto_recalibrate = false;
 }
 
@@ -353,8 +353,8 @@ xmass_sync_error_t xmass_sync_start_streaming(xmass_sync_state_t *state)
     }
     
     state->streaming = true;
-    usleep(100000);  /* 100ms settle time */
-    
+    usleep(XMASS_SYNC_STREAM_SETTLE_MS * 1000);  /* Convert ms to us */
+
     printf("[xMASS Sync] All devices streaming\n");
     
     return XMASS_SYNC_OK;
@@ -416,7 +416,7 @@ xmass_sync_error_t xmass_sync_capture_samples(xmass_sync_state_t *state,
         
         /* Placeholder: generate test data */
         for (size_t j = 0; j < num_samples && j < buffers[i].num_samples; j++) {
-            double phase = 2.0 * PI * j / 100.0 + (i * PI / 4.0);
+            double phase = 2.0 * M_PI * j / 100.0 + (i * M_PI / 4.0);
             buffers[i].samples[j] = cosf(phase) + I * sinf(phase);
         }
         buffers[i].num_samples = num_samples;
@@ -458,11 +458,29 @@ xmass_sync_error_t xmass_sync_calibrate_phase(xmass_sync_state_t *state,
         }
     }
     
-    /* Configure devices for calibration */
-    xmass_carrier_set_lo_frequency(state->carrier, calibration_freq);
-xmass_sync_configure_devices(state, 0, 1e6, 40.0);
-    xmass_sync_setup_streams(state);
-    xmass_sync_start_streaming(state);
+    /* Configure devices for calibration
+     * Note: LO is set to calibration_freq, SDR tuned to baseband (0 Hz)
+     * since the LMK05318B distributes the common LO to all modules
+     */
+    xmass_error_t carrier_err = xmass_carrier_set_lo_frequency(state->carrier, calibration_freq);
+    if (carrier_err != XMASS_OK && carrier_err != XMASS_ERR_LMK_NOT_ACCESSIBLE) {
+        printf("[xMASS Sync] Warning: Failed to set LO frequency (error %d)\n", carrier_err);
+    }
+
+    xmass_sync_error_t dev_err = xmass_sync_configure_devices(state, 0, 1e6, 40.0);
+    if (dev_err != XMASS_SYNC_OK) {
+        printf("[xMASS Sync] Warning: Failed to configure devices (error %d)\n", dev_err);
+    }
+
+    xmass_sync_error_t stream_err = xmass_sync_setup_streams(state);
+    if (stream_err != XMASS_SYNC_OK) {
+        printf("[xMASS Sync] Warning: Failed to setup streams (error %d)\n", stream_err);
+    }
+
+    xmass_sync_error_t start_err = xmass_sync_start_streaming(state);
+    if (start_err != XMASS_SYNC_OK) {
+        printf("[xMASS Sync] Warning: Failed to start streaming (error %d)\n", start_err);
+    }
     
     /* Capture multiple snapshots for averaging */
     double phase_measurements[XMASS_SYNC_CAL_SNAPSHOTS][XMASS_SYNC_MAX_CHANNELS];
@@ -470,22 +488,56 @@ xmass_sync_configure_devices(state, 0, 1e6, 40.0);
     
     printf("[xMASS Sync] Capturing %d snapshots for calibration...\n",
            XMASS_SYNC_CAL_SNAPSHOTS);
-    
+
+    int failed_captures = 0;
+    double min_signal_level = 1e10;
+
     for (int snapshot = 0; snapshot < XMASS_SYNC_CAL_SNAPSHOTS; snapshot++) {
-        /* Capture samples */
-        xmass_sync_capture_samples(state, buffers, XMASS_SYNC_DEFAULT_CAL_SAMPLES);
-        
+        /* Capture samples with error checking */
+        xmass_sync_error_t cap_err = xmass_sync_capture_samples(state, buffers, XMASS_SYNC_DEFAULT_CAL_SAMPLES);
+        if (cap_err != XMASS_SYNC_OK) {
+            printf("[xMASS Sync] Warning: Capture failed on snapshot %d (error %d)\n", snapshot, cap_err);
+            failed_captures++;
+            if (failed_captures > XMASS_SYNC_CAL_SNAPSHOTS / 2) {
+                /* Too many failures, abort calibration */
+                xmass_sync_stop_streaming(state);
+                for (int i = 0; i < state->num_channels; i++) {
+                    xmass_sync_buffer_free(&buffers[i]);
+                }
+                return XMASS_SYNC_ERR_CALIBRATION_FAILED;
+            }
+            continue;
+        }
+
+        /* Verify buffers are valid */
+        bool valid_capture = true;
+        for (int ch = 0; ch < state->num_channels; ch++) {
+            if (!buffers[ch].valid || buffers[ch].num_samples == 0) {
+                valid_capture = false;
+                break;
+            }
+        }
+        if (!valid_capture) {
+            failed_captures++;
+            continue;
+        }
+
         /* Measure phase and amplitude relative to channel 0 */
         for (int ch = 0; ch < state->num_channels; ch++) {
             if (ch == 0) {
                 phase_measurements[snapshot][0] = 0.0;
-                
+
                 /* Calculate mean amplitude */
                 double sum = 0.0;
                 for (size_t j = 0; j < buffers[0].num_samples; j++) {
                     sum += cabsf(buffers[0].samples[j]);
                 }
                 amplitude_measurements[snapshot][0] = sum / buffers[0].num_samples;
+
+                /* Track minimum signal level for quality check */
+                if (amplitude_measurements[snapshot][0] < min_signal_level) {
+                    min_signal_level = amplitude_measurements[snapshot][0];
+                }
             } else {
                 /* Cross-correlation with reference (channel 0) */
                 float complex correlation = 0.0f;
@@ -493,22 +545,44 @@ xmass_sync_configure_devices(state, 0, 1e6, 40.0);
                     correlation += buffers[ch].samples[j] * conjf(buffers[0].samples[j]);
                 }
                 correlation /= buffers[ch].num_samples;
-                
+
                 phase_measurements[snapshot][ch] = cargf(correlation);
-                
+
                 /* Calculate mean amplitude */
                 double sum = 0.0;
                 for (size_t j = 0; j < buffers[ch].num_samples; j++) {
                     sum += cabsf(buffers[ch].samples[j]);
                 }
                 amplitude_measurements[snapshot][ch] = sum / buffers[ch].num_samples;
+
+                if (amplitude_measurements[snapshot][ch] < min_signal_level) {
+                    min_signal_level = amplitude_measurements[snapshot][ch];
+                }
             }
         }
-        
-        usleep(10000);  /* 10ms between snapshots */
+
+        usleep(XMASS_SYNC_SNAPSHOT_DELAY_MS * 1000);  /* Convert ms to us */
     }
-    
+
     xmass_sync_stop_streaming(state);
+
+    /* Check if we got enough successful captures */
+    int successful_captures = XMASS_SYNC_CAL_SNAPSHOTS - failed_captures;
+    if (successful_captures < XMASS_SYNC_CAL_SNAPSHOTS / 2) {
+        printf("[xMASS Sync] Error: Only %d/%d successful captures\n",
+               successful_captures, XMASS_SYNC_CAL_SNAPSHOTS);
+        for (int i = 0; i < state->num_channels; i++) {
+            xmass_sync_buffer_free(&buffers[i]);
+        }
+        return XMASS_SYNC_ERR_CALIBRATION_FAILED;
+    }
+
+    /* Check signal level */
+    if (min_signal_level < XMASS_SYNC_MIN_AMPLITUDE) {
+        printf("[xMASS Sync] Warning: Very weak signal detected (level=%.2e)\n", min_signal_level);
+        printf("[xMASS Sync] Calibration may be unreliable. Check input signal.\n");
+        /* Continue anyway but warn */
+    }
     
     /* Average measurements */
     for (int ch = 0; ch < state->num_channels; ch++) {
@@ -524,6 +598,7 @@ xmass_sync_configure_devices(state, 0, 1e6, 40.0);
         double avg_amp = amp_sum / XMASS_SYNC_CAL_SNAPSHOTS;
         
         /* Amplitude correction relative to channel 0 */
+        /* Protect against division by zero for dead channels */
         if (ch == 0) {
             state->calibration.amplitude_correction[ch] = 1.0;
         } else {
@@ -532,7 +607,11 @@ xmass_sync_configure_devices(state, 0, 1e6, 40.0);
                 ref_amp += amplitude_measurements[s][0];
             }
             ref_amp /= XMASS_SYNC_CAL_SNAPSHOTS;
-            state->calibration.amplitude_correction[ch] = ref_amp / avg_amp;
+            double safe_avg_amp = (avg_amp > XMASS_SYNC_MIN_AMPLITUDE) ? avg_amp : XMASS_SYNC_MIN_AMPLITUDE;
+            state->calibration.amplitude_correction[ch] = ref_amp / safe_avg_amp;
+            if (avg_amp < XMASS_SYNC_MIN_AMPLITUDE) {
+                printf("[xMASS Sync] Warning: Channel %d has near-zero amplitude\n", ch);
+            }
         }
         
         /* Calculate phase stability (std dev) */
@@ -557,9 +636,9 @@ xmass_sync_configure_devices(state, 0, 1e6, 40.0);
     for (int ch = 0; ch < state->num_channels; ch++) {
         printf("  usdr%d   | %7.2f°    | %6.3fx              | ±%.2f°\n",
                ch,
-               state->calibration.phase_offset[ch] * 180.0 / PI,
+               state->calibration.phase_offset[ch] * 180.0 / M_PI,
                state->calibration.amplitude_correction[ch],
-               state->calibration.phase_stability[ch] * 180.0 / PI);
+               state->calibration.phase_stability[ch] * 180.0 / M_PI);
     }
     
     /* Cleanup */
@@ -677,42 +756,91 @@ xmass_sync_error_t xmass_sync_save_calibration(xmass_sync_state_t *state,
 xmass_sync_error_t xmass_sync_load_calibration(xmass_sync_state_t *state,
                                                 const char *filename)
 {
-    if (!state || !filename) {
+    if (!state || !filename || filename[0] == '\0') {
         return XMASS_SYNC_ERR_INVALID_PARAM;
     }
-    
+
     FILE *fp = fopen(filename, "r");
     if (!fp) {
         return XMASS_SYNC_ERR_DEVICE_ERROR;
     }
-    
+
+    /* Initialize calibration to default/invalid state before loading */
+    memset(&state->calibration, 0, sizeof(state->calibration));
+
     char line[256];
+    int valid_entries = 0;
+    int phase_entries = 0;
+    int amplitude_entries = 0;
+
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        
+        /* Check for line truncation */
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n' && !feof(fp)) {
+            /* Skip truncated line */
+            int c;
+            while ((c = fgetc(fp)) != '\n' && c != EOF);
+            continue;
+        }
+
+        /* Remove trailing whitespace */
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                          line[len - 1] == ' ' || line[len - 1] == '\t')) {
+            line[--len] = '\0';
+        }
+
+        /* Skip empty lines and comments */
+        if (len == 0 || line[0] == '#') continue;
+
         char key[64];
         double value;
-        
-        if (sscanf(line, "%63[^=]=%lf", key, &value) == 2) {
-            if (strcmp(key, "calibration_freq") == 0) {
+
+        if (sscanf(line, "%63[^=]=%lf", key, &value) != 2) {
+            continue;  /* Skip malformed lines */
+        }
+
+        /* Validate and store values */
+        if (strcmp(key, "calibration_freq") == 0) {
+            /* Frequency should be positive and reasonable (1 MHz to 10 GHz) */
+            if (value >= 1e6 && value <= 10e9) {
                 state->calibration.calibration_freq = value;
-            } else if (strcmp(key, "timestamp") == 0) {
+                valid_entries++;
+            }
+        } else if (strcmp(key, "timestamp") == 0) {
+            /* Timestamp should be a positive number */
+            if (value >= 0) {
                 state->calibration.calibration_timestamp = (uint64_t)value;
-            } else if (strcmp(key, "valid") == 0) {
-                state->calibration.valid = (value != 0);
-            } else if (strcmp(key, "count") == 0) {
+                valid_entries++;
+            }
+        } else if (strcmp(key, "valid") == 0) {
+            state->calibration.valid = (value != 0);
+            valid_entries++;
+        } else if (strcmp(key, "count") == 0) {
+            if (value >= 0 && value <= UINT32_MAX) {
                 state->calibration.calibration_count = (uint32_t)value;
-            } else {
-                /* Parse channel-specific values */
-                int ch;
-                char param[32];
-                if (sscanf(key, "ch%d_%31s", &ch, param) == 2) {
-                    if (ch >= 0 && ch < XMASS_SYNC_MAX_CHANNELS) {
-                        if (strcmp(param, "phase") == 0) {
+                valid_entries++;
+            }
+        } else {
+            /* Parse channel-specific values */
+            int ch;
+            char param[32];
+            if (sscanf(key, "ch%d_%31s", &ch, param) == 2) {
+                if (ch >= 0 && ch < XMASS_SYNC_MAX_CHANNELS) {
+                    if (strcmp(param, "phase") == 0) {
+                        /* Phase should be in radians, typically -2*pi to 2*pi */
+                        if (value >= -2 * M_PI && value <= 2 * M_PI) {
                             state->calibration.phase_offset[ch] = value;
-                        } else if (strcmp(param, "amplitude") == 0) {
+                            phase_entries++;
+                        }
+                    } else if (strcmp(param, "amplitude") == 0) {
+                        /* Amplitude correction should be positive */
+                        if (value > 0 && value < 100.0) {
                             state->calibration.amplitude_correction[ch] = value;
-                        } else if (strcmp(param, "stability") == 0) {
+                            amplitude_entries++;
+                        }
+                    } else if (strcmp(param, "stability") == 0) {
+                        /* Stability (std dev) should be non-negative */
+                        if (value >= 0 && value <= M_PI) {
                             state->calibration.phase_stability[ch] = value;
                         }
                     }
@@ -720,11 +848,20 @@ xmass_sync_error_t xmass_sync_load_calibration(xmass_sync_state_t *state,
             }
         }
     }
-    
+
     fclose(fp);
-    
+
+    /* Validate that we got a complete calibration */
+    if (valid_entries < 3 || phase_entries < XMASS_SYNC_MAX_CHANNELS ||
+        amplitude_entries < XMASS_SYNC_MAX_CHANNELS) {
+        printf("[xMASS Sync] Warning: Incomplete calibration file (valid=%d, phase=%d, amp=%d)\n",
+               valid_entries, phase_entries, amplitude_entries);
+        state->calibration.valid = false;
+        return XMASS_SYNC_ERR_CALIBRATION_FAILED;
+    }
+
     printf("[xMASS Sync] Calibration loaded from %s\n", filename);
-    
+
     return XMASS_SYNC_OK;
 }
 
@@ -792,7 +929,7 @@ xmass_sync_error_t xmass_sync_measure_coherence(xmass_sync_state_t *state,
     /* Allocate buffers */
     xmass_sync_buffer_t buffers[XMASS_SYNC_MAX_CHANNELS];
     for (int i = 0; i < state->num_channels; i++) {
-        xmass_sync_error_t err = xmass_sync_buffer_alloc(&buffers[i], 4096);
+        xmass_sync_error_t err = xmass_sync_buffer_alloc(&buffers[i], XMASS_SYNC_COHERENCE_SAMPLES);
         if (err != XMASS_SYNC_OK) {
             for (int j = 0; j < i; j++) {
                 xmass_sync_buffer_free(&buffers[j]);
@@ -800,9 +937,9 @@ xmass_sync_error_t xmass_sync_measure_coherence(xmass_sync_state_t *state,
             return err;
         }
     }
-    
+
     /* Capture samples */
-    xmass_sync_capture_samples(state, buffers, 4096);
+    xmass_sync_capture_samples(state, buffers, XMASS_SYNC_COHERENCE_SAMPLES);
     
     /* Apply corrections */
     xmass_sync_apply_corrections(state, buffers);
@@ -839,7 +976,7 @@ bool xmass_sync_verify_quality(xmass_sync_state_t *state, double max_phase_error
     for (int ch = 1; ch < state->num_channels; ch++) {
         if (fabs(phase_diffs[ch]) > max_phase_error) {
             printf("[xMASS Sync] Channel %d phase error %.2f° exceeds limit %.2f°\n",
-                   ch, phase_diffs[ch] * 180.0 / PI, max_phase_error * 180.0 / PI);
+                   ch, phase_diffs[ch] * 180.0 / M_PI, max_phase_error * 180.0 / M_PI);
             return false;
         }
     }
@@ -886,9 +1023,9 @@ void xmass_sync_print_status(xmass_sync_state_t *state)
         for (int ch = 0; ch < state->num_channels; ch++) {
             printf("  %d       | %7.2f°    | %6.3fx   | ±%.2f°\n",
                    ch,
-                   state->calibration.phase_offset[ch] * 180.0 / PI,
+                   state->calibration.phase_offset[ch] * 180.0 / M_PI,
                    state->calibration.amplitude_correction[ch],
-                   state->calibration.phase_stability[ch] * 180.0 / PI);
+                   state->calibration.phase_stability[ch] * 180.0 / M_PI);
         }
     }
     

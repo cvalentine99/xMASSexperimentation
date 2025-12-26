@@ -155,8 +155,8 @@ class XMASSSync:
         
         print("[xMASS] Note: LMK05318B configuration is pre-set by carrier board")
         return clocks
-    
-        def set_lo_frequency(self, frequency: float) -> None:
+
+    def set_lo_frequency(self, frequency: float) -> None:
         """
         Set the common LO frequency for all devices.
 
@@ -336,9 +336,17 @@ class XMASSSync:
         # Average measurements
         self.calibration.phase_offsets = np.mean(phase_measurements, axis=0)
         avg_amplitudes = np.mean(amplitude_measurements, axis=0)
-        
+
         # Compute amplitude corrections (normalize to device 0)
-        self.calibration.amplitude_corrections = avg_amplitudes[0] / avg_amplitudes
+        # Protect against division by zero for dead channels or no signal
+        MIN_AMPLITUDE = 1e-10
+        safe_amplitudes = np.maximum(avg_amplitudes, MIN_AMPLITUDE)
+        self.calibration.amplitude_corrections = avg_amplitudes[0] / safe_amplitudes
+
+        # Warn about potential dead channels
+        for i, amp in enumerate(avg_amplitudes):
+            if amp < MIN_AMPLITUDE:
+                print(f"  [!] Warning: usdr{i} has near-zero amplitude - check antenna connection")
         
         # Calculate stability (std deviation across snapshots)
         self.calibration.phase_stability = np.std(phase_measurements, axis=0)
