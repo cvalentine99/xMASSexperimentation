@@ -1,0 +1,37 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled objects
+*.o
+*.so
+*.a
+*.dylib
+
+# Executables
+test_lmk05318b
+test_carrier
+test_sync
+xmass_calibrate
+xmass_df_example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Calibration files
+*.cal
+
+# OS files
+.DS_Store
+Thumbs.db
